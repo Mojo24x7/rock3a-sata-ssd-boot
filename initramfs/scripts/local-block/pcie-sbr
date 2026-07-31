@@ -1,0 +1,129 @@
+#!/bin/sh
+# /etc/initramfs-tools/scripts/local-block/pcie-sbr
+#
+# Recover a PCIe endpoint that U-Boot left in a state Linux will not re-enumerate.
+#
+# initramfs-tools runs scripts in local-block/ REPEATEDLY while it waits for the root
+# device, so we get several attempts per boot and can escalate. The important one is the
+# Secondary Bus Reset; the rest are cheap things worth trying first or last.
+#
+# See https://github.com/Mojo24x7/rock3a-sata-ssd-boot
+PREREQ=""
+prereqs(){ echo "$PREREQ"; }
+case $1 in
+  prereqs) prereqs; exit 0 ;;
+esac
+
+SBR_HOLD=1
+SBR_FIRST_ATTEMPT=1
+[ -r /etc/pcie-sbr-boot.conf ] && . /etc/pcie-sbr-boot.conf
+
+LOG=/run/pcie-sbr.log
+CNT=/run/pcie-sbr.count
+
+n=0
+[ -f "$CNT" ] && n=$(cat "$CNT" 2>/dev/null)
+n=$((n + 1)); echo "$n" > "$CNT"
+log(){ echo "[pcie-sbr #$n] $*" >> "$LOG"; }
+
+# --- helpers ---------------------------------------------------------------
+
+find_bridges(){          # every PCI bridge (class 0x0604xx)
+  for d in /sys/bus/pci/devices/*; do
+    [ -r "$d/class" ] || continue
+    case "$(cat "$d/class" 2>/dev/null)" in
+      0x0604*) basename "$d" ;;
+    esac
+  done
+}
+
+rescan_scsi(){
+  for h in /sys/class/scsi_host/host*; do
+    [ -d "$h" ] && echo "- - -" > "$h/scan" 2>/dev/null
+  done
+}
+
+# Secondary Bus Reset: bit 6 of Bridge Control, PCI config offset 0x3E (=62).
+# Hot-resets everything behind the bridge, which is the only way from userspace to make
+# an endpoint that U-Boot configured come back up cleanly.
+sbr(){
+  bdf=$1; hold=$2
+  cfg=/sys/bus/pci/devices/$bdf/config
+  [ -w "$cfg" ] || { log "    $bdf: config not writable"; return 1; }
+  old=$(dd if="$cfg" bs=1 skip=62 count=1 2>/dev/null | od -An -tu1 | tr -d ' \n')
+  case "$old" in ''|*[!0-9]*) log "    $bdf: could not read BridgeControl"; return 1 ;; esac
+  new=$((old | 64))
+  log "    $bdf BridgeControl 0x3E: $old -> $new (assert SBR), hold ${hold}s"
+  printf "\\$(printf '%03o' "$new")" | dd of="$cfg" bs=1 seek=62 count=1 conv=notrunc 2>/dev/null
+  sleep "$hold"
+  printf "\\$(printf '%03o' "$old")" | dd of="$cfg" bs=1 seek=62 count=1 conv=notrunc 2>/dev/null
+  log "    $bdf BridgeControl 0x3E: $new -> $old (release SBR)"
+  sleep 2
+}
+
+state(){ echo "pci=$(ls /sys/bus/pci/devices/ 2>/dev/null | tr '\n' ' ')blk=$(ls -d /dev/sd* /dev/nvme*n1 2>/dev/null | tr '\n' ' ')"; }
+
+# --- main ------------------------------------------------------------------
+
+log "waiting for: $1"
+log "  before: $(state)"
+[ -e "$1" ] && { log "  target already present, nothing to do"; exit 0; }
+
+BRIDGES=$(find_bridges)
+log "  bridges: ${BRIDGES:-none}"
+
+step=$((n - SBR_FIRST_ATTEMPT + 1))
+case "$step" in
+  0|-*)                                     # attempts before the SBR: cheap rescans
+    log "  cheap: rescan SCSI hosts"
+    rescan_scsi
+    ;;
+  1)
+    log "  SECONDARY BUS RESET (hold ${SBR_HOLD}s)"
+    for b in $BRIDGES; do sbr "$b" "$SBR_HOLD"; done
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null
+    sleep 2; rescan_scsi
+    ;;
+  2)
+    log "  SECONDARY BUS RESET again, longer hold"
+    for b in $BRIDGES; do sbr "$b" $((SBR_HOLD + 2)); done
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null
+    sleep 3; rescan_scsi
+    ;;
+  3)
+    log "  plain full PCI rescan"
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null
+    sleep 2; rescan_scsi
+    ;;
+  4)
+    log "  remove bridges then re-enumerate"
+    for b in $BRIDGES; do echo 1 > "/sys/bus/pci/devices/$b/remove" 2>/dev/null; done
+    sleep 1
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null
+    sleep 3; rescan_scsi
+    ;;
+  5)
+    log "  unbind/rebind storage drivers"
+    for d in /sys/bus/pci/devices/*; do
+      [ -r "$d/class" ] || continue
+      case "$(cat "$d/class" 2>/dev/null)" in
+        0x0106*|0x0108*)                     # SATA AHCI, NVMe
+          b=$(basename "$d")
+          drv=$(readlink "$d/driver" 2>/dev/null | sed 's|.*/||')
+          [ -n "$drv" ] || continue
+          echo "$b" > "/sys/bus/pci/drivers/$drv/unbind" 2>/dev/null && log "    unbound $b from $drv"
+          sleep 1
+          echo "$b" > "/sys/bus/pci/drivers/$drv/bind"   2>/dev/null && log "    rebound $b to $drv"
+          ;;
+      esac
+    done
+    sleep 2
+    ;;
+  *)
+    [ "$step" -le 10 ] && log "  idle (enable ENABLE_TELNET to poke by hand)"
+    ;;
+esac
+
+log "  after:  $(state)"
+[ -e "$1" ] && log "  *** TARGET PRESENT - recovery step $step worked ***"
+exit 0

@@ -1,0 +1,47 @@
+#!/bin/sh
+# /etc/initramfs-tools/scripts/init-premount/pcie-sbr-net
+#
+# Bring ethernet up inside the initramfs, and optionally start a telnet rescue shell.
+# The point: when the root filesystem never mounts you have no console and no disk, but
+# the kernel and initramfs are already in RAM and the NIC driver is built in - so the
+# network is the one way in and the one way out.
+#
+# ENABLE_TELNET is an UNAUTHENTICATED ROOT SHELL. Default off. Debug use only.
+PREREQ=""
+prereqs(){ echo "$PREREQ"; }
+case $1 in
+  prereqs) prereqs; exit 0 ;;
+esac
+
+ENABLE_TELNET=no
+TELNET_PORT=23
+NET_IFACE=eth0
+[ -r /etc/pcie-sbr-boot.conf ] && . /etc/pcie-sbr-boot.conf
+
+LOG=/run/pcie-sbr.log
+
+# Nothing to do unless we were asked to report or to open a shell.
+[ "$ENABLE_TELNET" = "yes" ] || [ -n "${DIAG_HOST:-}" ] || exit 0
+
+echo "[net] init-premount start" >> "$LOG"
+
+ip link set "$NET_IFACE" up 2>/dev/null || ifconfig "$NET_IFACE" up 2>/dev/null
+sleep 1
+# klibc ipconfig is always present in a Debian initramfs; busybox udhcpc is the fallback
+if ! ipconfig -t 20 "$NET_IFACE" >> "$LOG" 2>&1; then
+  udhcpc -i "$NET_IFACE" -n -q -t 6 >> "$LOG" 2>&1
+fi
+echo "[net] $(ip addr show "$NET_IFACE" 2>/dev/null | grep 'inet ' | tr -s ' ')" >> "$LOG"
+
+if [ "$ENABLE_TELNET" = "yes" ]; then
+  [ -d /dev/pts ] || mkdir -p /dev/pts
+  mount -t devpts devpts /dev/pts 2>/dev/null      # telnetd needs a pty
+  if command -v busybox >/dev/null 2>&1; then
+    (busybox telnetd -l /bin/sh -p "$TELNET_PORT" >/dev/null 2>&1 &)
+    echo "[net] telnetd on port $TELNET_PORT (ROOT SHELL, no auth)" >> "$LOG"
+  else
+    echo "[net] busybox missing - cannot start telnetd" >> "$LOG"
+  fi
+fi
+
+exit 0

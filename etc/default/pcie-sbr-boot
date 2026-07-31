@@ -1,0 +1,32 @@
+# /etc/default/pcie-sbr-boot
+#
+# Configuration for the initramfs PCIe Secondary-Bus-Reset boot fix.
+# Copied into the initramfs at build time by /etc/initramfs-tools/hooks/pcie-sbr,
+# so run `update-initramfs -u` after changing anything here.
+
+# How long to hold Secondary Bus Reset, in seconds. 1 is enough on a JMB585.
+SBR_HOLD=1
+
+# Which local-block retry issues the SBR. initramfs-tools calls the hook repeatedly
+# while waiting for the root device; attempts before this one just rescan SCSI hosts.
+# Set to 1 to reset on the very first attempt (fastest boot).
+SBR_FIRST_ATTEMPT=1
+
+# Network interface used for diagnostics / telnet.
+NET_IFACE=eth0
+
+# --- diagnostics -----------------------------------------------------------
+# If the boot fails, ship dmesg + PCI/SCSI/block state to this host over raw TCP.
+# Leave empty to disable. Receiving end: python3 tools/diag_listener.py
+DIAG_HOST=
+DIAG_PORT=9999
+
+# --- interactive rescue shell ---------------------------------------------
+# yes = start `busybox telnetd -l /bin/sh` inside the initramfs while it waits for
+# the root device, so you can log in and poke /sys by hand.
+#
+# ⚠️  THIS IS AN UNAUTHENTICATED ROOT SHELL ON THE NETWORK.
+#     It only exists inside the initramfs and dies at switch_root, but enable it
+#     only while you are actively debugging, and never on an untrusted network.
+ENABLE_TELNET=no
+TELNET_PORT=23

@@ -1,0 +1,27 @@
+#!/bin/sh
+# /etc/initramfs-tools/hooks/pcie-sbr
+#
+# The initramfs scripts run before the real root is mounted, so they cannot read
+# /etc/default/pcie-sbr-boot from the target filesystem. Copy the config into the
+# initramfs at build time, and make sure the tools the scripts need are present.
+PREREQ=""
+prereqs(){ echo "$PREREQ"; }
+case $1 in
+  prereqs) prereqs; exit 0 ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+# config -> /etc/pcie-sbr-boot.conf inside the initramfs
+if [ -r /etc/default/pcie-sbr-boot ]; then
+  mkdir -p "${DESTDIR}/etc"
+  cp /etc/default/pcie-sbr-boot "${DESTDIR}/etc/pcie-sbr-boot.conf"
+fi
+
+# busybox provides nc / udhcpc / telnetd and a usable shell. BUSYBOX=y in
+# initramfs.conf normally pulls it in; copy it explicitly if it is missing.
+if [ ! -e "${DESTDIR}/bin/busybox" ] && [ -x /usr/bin/busybox ]; then
+  copy_exec /usr/bin/busybox /bin
+fi
+
+exit 0

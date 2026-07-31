@@ -1,0 +1,84 @@
+#!/bin/sh
+# /etc/initramfs-tools/scripts/panic/pcie-sbr-diag
+#
+# Runs when initramfs is about to drop to a rescue shell. Collects everything useful
+# about why the root device is missing and ships it over raw TCP to DIAG_HOST, so a
+# headless board with no serial console can still tell you what went wrong.
+#
+# Receiving end:  python3 tools/diag_listener.py
+#
+# NOTE: with `rootwait` on the kernel command line, initramfs waits FOREVER and this
+# hook never runs. Drop rootwait for a diagnostic boot, or rely on the log that
+# scripts/local-block/pcie-sbr writes to /run (which survives into the booted system).
+PREREQ=""
+prereqs(){ echo "$PREREQ"; }
+case $1 in
+  prereqs) prereqs; exit 0 ;;
+esac
+
+DIAG_PORT=9999
+NET_IFACE=eth0
+[ -r /etc/pcie-sbr-boot.conf ] && . /etc/pcie-sbr-boot.conf
+[ -n "${DIAG_HOST:-}" ] || exit 0
+
+OUT=/run/pcie-sbr-report.txt
+
+{
+  echo "===== initramfs boot diagnosis ====="
+  echo "date: $(date 2>/dev/null)"
+  echo
+  echo "--- /proc/cmdline"; cat /proc/cmdline 2>/dev/null
+  echo
+  echo "--- block devices"; ls -l /dev/sd* /dev/nvme* /dev/mmcblk* 2>/dev/null
+  echo "--- /sys/block"; ls /sys/block/ 2>/dev/null
+  echo
+  echo "--- /dev/disk/by-uuid";     ls -l /dev/disk/by-uuid/ 2>/dev/null
+  echo "--- /dev/disk/by-partuuid"; ls -l /dev/disk/by-partuuid/ 2>/dev/null
+  echo
+  echo "--- PCI devices"
+  for d in /sys/bus/pci/devices/*; do
+    [ -d "$d" ] || continue
+    printf "%s vendor=%s device=%s class=%s driver=%s\n" \
+      "$(basename "$d")" \
+      "$(cat "$d/vendor" 2>/dev/null)" "$(cat "$d/device" 2>/dev/null)" \
+      "$(cat "$d/class"  2>/dev/null)" \
+      "$(readlink "$d/driver" 2>/dev/null | sed 's|.*/||')"
+  done
+  echo
+  echo "--- /proc/bus/pci/devices"; cat /proc/bus/pci/devices 2>/dev/null
+  echo
+  echo "--- SCSI hosts"
+  for h in /sys/class/scsi_host/host*; do
+    [ -d "$h" ] && printf "%s proc_name=%s\n" "$(basename "$h")" "$(cat "$h/proc_name" 2>/dev/null)"
+  done
+  echo
+  echo "--- recovery hook log"
+  cat /run/pcie-sbr.log 2>/dev/null || echo "(none - local-block hook never ran)"
+  echo
+  echo "--- FULL dmesg"; dmesg 2>/dev/null
+  echo "===== END ====="
+} > "$OUT" 2>&1
+
+# network may already be up from init-premount; if not, bring it up now
+ip link set "$NET_IFACE" up 2>/dev/null || ifconfig "$NET_IFACE" up 2>/dev/null
+ip addr show "$NET_IFACE" 2>/dev/null | grep -q 'inet ' || {
+  sleep 2
+  ipconfig -t 20 "$NET_IFACE" >> "$OUT" 2>&1 || udhcpc -i "$NET_IFACE" -n -q -t 6 >> "$OUT" 2>&1
+}
+
+for try in 1 2 3; do
+  nc "$DIAG_HOST" "$DIAG_PORT" < "$OUT" && break
+  sleep 3
+done
+
+# last resort: stash it on any FAT partition that did appear
+for p in /dev/sda1 /dev/sda2 /dev/nvme0n1p1; do
+  [ -b "$p" ] || continue
+  mkdir -p /run/fat 2>/dev/null
+  mount -t vfat "$p" /run/fat 2>/dev/null || continue
+  cp "$OUT" /run/fat/boot-diag.txt 2>/dev/null
+  umount /run/fat 2>/dev/null
+  break
+done
+
+exit 0
