@@ -36,6 +36,7 @@ say(){ printf '\n== %s\n' "$*"; }
 if [ "$UNINSTALL" = yes ]; then
   say "removing hooks"
   rm -fv "$IT/scripts/local-block/pcie-sbr" \
+         "$IT/scripts/init-bottom/pcie-sbr-shell-off" \
          "$IT/scripts/init-premount/pcie-sbr-net" \
          "$IT/scripts/panic/pcie-sbr-diag" \
          "$IT/hooks/pcie-sbr" || true
@@ -84,6 +85,7 @@ done
 install -D -m 755 "$SRC/initramfs/scripts/local-block/pcie-sbr"        "$IT/scripts/local-block/pcie-sbr"
 install -D -m 755 "$SRC/initramfs/scripts/init-premount/pcie-sbr-net"  "$IT/scripts/init-premount/pcie-sbr-net"
 install -D -m 755 "$SRC/initramfs/scripts/panic/pcie-sbr-diag"         "$IT/scripts/panic/pcie-sbr-diag"
+install -D -m 755 "$SRC/initramfs/scripts/init-bottom/pcie-sbr-shell-off" "$IT/scripts/init-bottom/pcie-sbr-shell-off"
 install -D -m 755 "$SRC/initramfs/hooks/pcie-sbr"                      "$IT/hooks/pcie-sbr"
 ls -l "$IT/scripts/local-block/pcie-sbr" "$IT/scripts/init-premount/pcie-sbr-net" \
       "$IT/scripts/panic/pcie-sbr-diag"  "$IT/hooks/pcie-sbr" | sed 's/^/   /'
@@ -133,6 +135,7 @@ if [ -z "$listing" ]; then
   ok=no
 else
   for want in scripts/local-block/pcie-sbr scripts/init-premount/pcie-sbr-net \
+              scripts/init-bottom/pcie-sbr-shell-off \
               scripts/panic/pcie-sbr-diag etc/pcie-sbr-boot.conf bin/busybox bin/dd bin/od; do
     case "$listing" in
       *"$want"*) printf '   ok      %s\n' "$want" ;;

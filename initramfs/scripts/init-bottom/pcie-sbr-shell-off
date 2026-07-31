@@ -1,0 +1,79 @@
+#!/bin/sh
+# /etc/initramfs-tools/scripts/init-bottom/pcie-sbr-shell-off
+#
+# Kill the emergency `nc` shell before switch_root.
+#
+# WHY THIS EXISTS: without it the listener SURVIVES into the booted system. Measured on a
+# ROCK 3A: after a successful boot, `ss -lntp` showed `busybox pid=227` still LISTENING on
+# *:23 -- an unauthenticated root shell on the LAN, permanently, not just for the boot
+# window. initramfs processes are not reliably reaped by switch_root, so anything started in
+# init-premount must be torn down here. dropbear-initramfs does exactly this (and also
+# removes root's authorized_keys and brings interfaces down); we owe the same hygiene.
+PREREQ=""
+prereqs(){ echo "$PREREQ"; }
+case $1 in
+  prereqs) prereqs; exit 0 ;;
+esac
+
+LOG=/run/pcie-sbr.log
+PIDFILE=/run/pcie-sbr-nc.pid
+
+kill_tree(){
+  pid=$1
+  [ -n "$pid" ] || return 1
+  [ -d "/proc/$pid" ] || return 1
+  # `nc -e` spawns /bin/sh children; kill the whole process group first so an attached
+  # session cannot outlive the listener. busybox kill takes one -PGID at a time.
+  sed -nr "s/^([0-9]+) \(.*\) \S $pid \1 .*/\1/p" /proc/[0-9]*/stat 2>/dev/null |
+    while read pgid; do kill -TERM -"$pgid" 2>/dev/null; done
+  sed -nr "s/^([0-9]+) \(.*\) \S $pid [0-9]+ .*/\1/p" /proc/[0-9]*/stat 2>/dev/null |
+    while read c; do kill -TERM "$c" 2>/dev/null; done
+  kill -TERM "$pid" 2>/dev/null
+  sleep 1
+  [ -d "/proc/$pid" ] && kill -KILL "$pid" 2>/dev/null
+  return 0
+}
+
+killed=0
+
+# 1. the pid we recorded when starting it
+if [ -r "$PIDFILE" ]; then
+  P=$(cat "$PIDFILE" 2>/dev/null)
+  if kill_tree "$P"; then
+    echo "[shell-off] killed nc shell pid $P" >> "$LOG"
+    killed=$((killed + 1))
+  fi
+  rm -f "$PIDFILE"
+fi
+
+# 2. belt and braces: anything still holding an `nc -ll` LISTENER. busybox has no
+#    pgrep/pkill, so walk /proc. ⚠️ Do NOT substring-match the whole cmdline: a shell whose
+#    script merely MENTIONS "nc -ll" matches too (this killed the test harness once -- the
+#    same trap as `pgrep -f` matching its own wrapper). So require the command line to
+#    actually BE an nc invocation: argv[0] is nc/busybox, argv[1] is nc when busybox, and a
+#    -l flag is present. Skip ourselves and our parent.
+SELF=$$
+PARENT=$(sed -nr 's/^[0-9]+ \(.*\) \S ([0-9]+) .*/\1/p' /proc/$$/stat 2>/dev/null)
+for d in /proc/[0-9]*; do
+  p=${d#/proc/}
+  [ "$p" = "$SELF" ] && continue
+  [ "$p" = "$PARENT" ] && continue
+  [ -r "$d/cmdline" ] || continue
+  set -- $(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+  [ $# -ge 2 ] || continue
+  a0=${1##*/}; a1=$2
+  case "$a0" in
+    nc)      is_nc=1 ;;
+    busybox) [ "$a1" = nc ] && is_nc=1 || is_nc=0 ;;
+    *)       is_nc=0 ;;
+  esac
+  [ "$is_nc" = 1 ] || continue
+  # must be a listener, not an outbound connection
+  has_l=0
+  for a in "$@"; do case "$a" in -l|-ll|-lk) has_l=1 ;; esac; done
+  [ "$has_l" = 1 ] || continue
+  kill_tree "$p" && { echo "[shell-off] killed stray nc listener pid $p" >> "$LOG"; killed=$((killed + 1)); }
+done
+
+[ "$killed" -eq 0 ] && echo "[shell-off] no nc shell running" >> "$LOG"
+exit 0

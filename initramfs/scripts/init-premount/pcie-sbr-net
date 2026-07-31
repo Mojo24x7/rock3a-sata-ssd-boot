@@ -27,20 +27,41 @@ echo "[net] init-premount start" >> "$LOG"
 
 ip link set "$NET_IFACE" up 2>/dev/null || ifconfig "$NET_IFACE" up 2>/dev/null
 sleep 1
-# klibc ipconfig is always present in a Debian initramfs; busybox udhcpc is the fallback
-if ! ipconfig -t 20 "$NET_IFACE" >> "$LOG" 2>&1; then
-  udhcpc -i "$NET_IFACE" -n -q -t 6 >> "$LOG" 2>&1
+# Idempotent: dropbear-initramfs also configures networking from init-premount and sorts
+# BEFORE us alphabetically, so the interface may already be up. Re-running ipconfig on a
+# configured interface just burns its 20s timeout.
+if ip addr show "$NET_IFACE" 2>/dev/null | grep -q 'inet '; then
+  echo "[net] $NET_IFACE already configured, skipping ipconfig" >> "$LOG"
+else
+  # klibc ipconfig is always present in a Debian initramfs; busybox udhcpc is the fallback
+  if ! ipconfig -t 20 "$NET_IFACE" >> "$LOG" 2>&1; then
+    udhcpc -i "$NET_IFACE" -n -q -t 6 >> "$LOG" 2>&1
+  fi
 fi
 echo "[net] $(ip addr show "$NET_IFACE" 2>/dev/null | grep 'inet ' | tr -s ' ')" >> "$LOG"
 
+# --- emergency shell -------------------------------------------------------
+# NOT telnetd: Debian's busybox is built WITHOUT the telnetd applet (248 applets, telnetd
+# absent - verified with `busybox --list`). The old code ran `busybox telnetd`, which failed
+# instantly, and then logged success unconditionally - so five boots reported "telnetd on
+# port 23" while nothing was ever listening. `nc -ll -e` IS compiled in and works.
+#
+# The real remote access is dropbear-initramfs on its own port (see /etc/dropbear-initramfs
+# /config). This nc shell is the zero-dependency fallback for when even that fails.
 if [ "$ENABLE_TELNET" = "yes" ]; then
-  [ -d /dev/pts ] || mkdir -p /dev/pts
-  mount -t devpts devpts /dev/pts 2>/dev/null      # telnetd needs a pty
   if command -v busybox >/dev/null 2>&1; then
-    (busybox telnetd -l /bin/sh -p "$TELNET_PORT" >/dev/null 2>&1 &)
-    echo "[net] telnetd on port $TELNET_PORT (ROOT SHELL, no auth)" >> "$LOG"
+    busybox nc -ll -p "$TELNET_PORT" -e /bin/sh >/dev/null 2>&1 &
+    NCPID=$!
+    sleep 1
+    # Log what is TRUE, not what was attempted.
+    if kill -0 "$NCPID" 2>/dev/null; then
+      echo "$NCPID" > /run/pcie-sbr-nc.pid    # init-bottom/pcie-sbr-shell-off kills this
+      echo "[net] nc shell listening on port $TELNET_PORT pid $NCPID (ROOT SHELL, no auth)" >> "$LOG"
+    else
+      echo "[net] nc shell FAILED to start on port $TELNET_PORT" >> "$LOG"
+    fi
   else
-    echo "[net] busybox missing - cannot start telnetd" >> "$LOG"
+    echo "[net] busybox missing - no emergency shell" >> "$LOG"
   fi
 fi
 

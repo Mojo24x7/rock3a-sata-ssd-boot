@@ -1,39 +1,48 @@
 # /etc/default/pcie-sbr-boot
 #
-# Configuration for the initramfs PCIe Secondary-Bus-Reset boot fix.
-# Copied into the initramfs at build time by /etc/initramfs-tools/hooks/pcie-sbr,
-# so run `update-initramfs -u` after changing anything here.
+# Configuration for the initramfs PCIe recovery hook. Copied into the initramfs at build time
+# by /etc/initramfs-tools/hooks/pcie-sbr, so run `update-initramfs -u` after changing anything.
 
-# How long to hold Secondary Bus Reset, in seconds. 1 is enough on a JMB585.
+# --- link recovery -----------------------------------------------------------
+# U-Boot hands off with the PCIe link already trained, and Linux's rk_pcie_establish_link()
+# returns early without enumerating the bus behind the bridge. The link itself is up, so the
+# hook escalates least-invasive first: rescan -> retrain -> one SBR + settle -> endpoint remove.
+
+# Max seconds to wait for the link to report Data Link Layer Active. Polled once a second and
+# exits as soon as the link is up, so a healthy boot pays only what it needs.
+SETTLE_S=15
+
+# Quiet time after anything that disturbs the link, before probing again. Below ~10s the probe
+# lands while the link is still training and sees nothing.
+POST_RESET_S=10
+
+# Set Retrain Link (bit 5 of Link Control) after a reset. A hot reset leaves the link at Gen1
+# even though both ends advertise more and Link Control 2 already targets the maximum. On a
+# multi-port SATA card this is the difference between ~500 MB/s and ~2 GB/s shared.
+RETRAIN=yes
+
+# Seconds to hold Secondary Bus Reset when it is needed at all.
 SBR_HOLD=1
 
-# Which local-block retry issues the SBR. initramfs-tools calls the hook repeatedly
-# while waiting for the root device; attempts before this one just rescan SCSI hosts.
-# Set to 1 to reset on the very first attempt (fastest boot).
-SBR_FIRST_ATTEMPT=1
+# How long the hook keeps retrying inside ONE invocation. It owns its own budget because
+# initramfs-tools gives local-block only ~30s of wall clock (slumber=30 in scripts/local).
+LOOP_BUDGET_S=150
+LOOP_MAX_STEPS=24
 
-# ⚠️ DO NOT ENABLE THIS. Setting the Retrain Link bit from the initramfs was measured to
-# STALL THE BOOT on a ROCK 3A - the link goes down during the retrain, the root device
-# disappears, and the machine never recovers (no console, no logs, tmpfs log lost).
-# Recovering full link speed is worth doing, but AFTER the system is up, where a failure
-# is harmless: use tools/pcie-relink.sh --apply. Left here only so the default is explicit.
-RETRAIN_AFTER_RESET=no
-
-# Network interface used for diagnostics / telnet.
+# Network interface used for diagnostics and the rescue shell.
 NET_IFACE=eth0
 
-# --- diagnostics -----------------------------------------------------------
+# --- diagnostics -------------------------------------------------------------
 # If the boot fails, ship dmesg + PCI/SCSI/block state to this host over raw TCP.
 # Leave empty to disable. Receiving end: python3 tools/diag_listener.py
 DIAG_HOST=
 DIAG_PORT=9999
 
-# --- interactive rescue shell ---------------------------------------------
-# yes = start `busybox telnetd -l /bin/sh` inside the initramfs while it waits for
-# the root device, so you can log in and poke /sys by hand.
+# --- interactive rescue shell ------------------------------------------------
+# yes = start `nc -ll -e /bin/sh` inside the initramfs while it waits for the root device.
 #
-# ⚠️  THIS IS AN UNAUTHENTICATED ROOT SHELL ON THE NETWORK.
-#     It only exists inside the initramfs and dies at switch_root, but enable it
-#     only while you are actively debugging, and never on an untrusted network.
+# THIS IS AN UNAUTHENTICATED ROOT SHELL ON THE NETWORK. It is shut down before switch_root by
+# scripts/init-bottom/pcie-sbr-shell-off, but enable it only while actively debugging.
+# For routine access prefer dropbear-initramfs on its own port - see docs/REMOTE-DEBUG.md.
 ENABLE_TELNET=no
 TELNET_PORT=23

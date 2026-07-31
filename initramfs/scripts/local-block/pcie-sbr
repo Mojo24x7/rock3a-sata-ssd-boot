@@ -3,222 +3,229 @@
 #
 # Recover a PCIe endpoint that U-Boot left in a state Linux will not re-enumerate.
 #
-# initramfs-tools runs scripts in local-block/ REPEATEDLY while it waits for the root
-# device, so we get several attempts per boot and can escalate. The important one is the
-# Secondary Bus Reset; the rest are cheap things worth trying first or last.
+# ---------------------------------------------------------------------------------------
+# WHY THIS LOOKS NOTHING LIKE THE OLD VERSION
 #
-# See https://github.com/Mojo24x7/rock3a-sata-ssd-boot
+# Measured LIVE from inside the initramfs on a ROCK 3A + Penta SATA HAT (JMB585), after
+# five failed/slow SD-less boots:
+#
+#     after 12s with the reset loop QUIETED : LinkStatus=0x3821 width=x2 DLL_Active=1
+#     set Retrain Link (cap+0x10 bit 5)     : speed 1 -> 3   (2.5 -> 8.0 GT/s)
+#     one PCI rescan                        : 0002:21:00.0 appeared, /dev/sda present
+#
+# The link was never broken. U-Boot trains it and hands off with LTSSM 0x30011; Linux's
+# rk_pcie_establish_link() sees link_up() and returns early, so it simply never ENUMERATES
+# bus 21. What the old hook did was assert a Secondary Bus Reset as its FIRST action --
+# breaking a working link -- then rescan 2s later while the link was still down, then reset
+# again ~8s after that. It destroyed the thing it was waiting for, and the apparent "1%
+# success rate" was really "did a rescan happen to land in a quiet, settled window".
+#
+# So: escalate LEAST-INVASIVE FIRST, and never probe sooner than POST_RESET_S after doing
+# anything that disturbs the link.
+#
+#   step 0  plain rescan, no reset at all      <- never tried on a virgin link before
+#   step 1  Retrain Link, then rescan          <- also brings the link to Gen3
+#   step 2  ONE SBR -> wait 10s -> retrain -> rescan
+#   step 3  remove the ENDPOINT (not the bridge) -> rescan -> retrain
+#   then repeat 2/3 until the budget runs out
+#
+# Other measured rules encoded here:
+#   * Never SBR once a driver is bound to the endpoint: it detaches the device and produces
+#     transient read errors (observed: ata2-6 "failed to stop engine (-19)").
+#   * Remove/rescan of the ENDPOINT recovers the block devices WITHOUT dropping the link;
+#     removing the BRIDGE drops it. Prefer the endpoint.
+#   * Never read link state while a reset is asserted -- that is how we mis-diagnosed the
+#     link as physically dead (DLL_Active reads 0 mid-SBR).
+#   * initramfs-tools 0.140 only gives local-block ~30s of WALL CLOCK (slumber=30), so this
+#     script owns its own budget and loops internally. `rootwait` does NOT help: init parses
+#     only rootdelay=, and rootdelay=N adds a blind sleep to every boot.
+#
+# https://github.com/Mojo24x7/rock3a-sata-ssd-boot
+# ---------------------------------------------------------------------------------------
 PREREQ=""
 prereqs(){ echo "$PREREQ"; }
 case $1 in
   prereqs) prereqs; exit 0 ;;
 esac
 
-SBR_HOLD=1
-SBR_FIRST_ATTEMPT=1
-RETRAIN_AFTER_RESET=no    # see tools/pcie-relink.sh - doing this in the initramfs stalls the boot
+SETTLE_S=15          # max seconds to wait for the link to report Data Link Layer Active
+POST_RESET_S=10      # quiet time after anything that disturbs the link, before probing
+SBR_HOLD=1           # seconds to hold Secondary Bus Reset
+LOOP_BUDGET_S=150    # our own retry budget inside ONE invocation
+LOOP_MAX_STEPS=24
+RETRAIN=yes          # set Retrain Link to recover Gen3 (safe: done before the disk is used)
 [ -r /etc/pcie-sbr-boot.conf ] && . /etc/pcie-sbr-boot.conf
 
 LOG=/run/pcie-sbr.log
 CNT=/run/pcie-sbr.count
-
 n=0
 [ -f "$CNT" ] && n=$(cat "$CNT" 2>/dev/null)
 n=$((n + 1)); echo "$n" > "$CNT"
 log(){ echo "[pcie-sbr #$n] $*" >> "$LOG"; }
 
-# --- helpers ---------------------------------------------------------------
+# --- low level ---------------------------------------------------------------
 
-rdb(){   # read one byte from a config-space file: rdb <file> <offset>
-  dd if="$1" bs=1 skip="$2" count=1 2>/dev/null | od -An -tu1 | tr -d ' \n'
-}
+rdb(){ od -An -tu1 -j "$2" -N 1 "$1" 2>/dev/null | tr -d ' \n'; }
+wrb(){ printf "\\$(printf '%03o' "$3")" | dd of="$1" bs=1 seek="$2" count=1 conv=notrunc 2>/dev/null; }
+rdw(){ lo=$(rdb "$1" "$2"); hi=$(rdb "$1" $(( $2 + 1 )))
+       case "$lo$hi" in ''|*[!0-9]*) return 1 ;; esac
+       echo $(( hi * 256 + lo )); }
 
-wrb(){   # write one byte: wrb <file> <offset> <value>
-  printf "\\$(printf '%03o' "$3")" | dd of="$1" bs=1 seek="$2" count=1 conv=notrunc 2>/dev/null
-}
+uptime_s(){ cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d. -f1; }
 
-pcie_cap(){   # echo the PCI Express capability offset for a device, or fail
+pcie_cap(){   # PCI Express capability offset, or fail
   cfg=/sys/bus/pci/devices/$1/config
   [ -r "$cfg" ] || return 1
-  sr=$(rdb "$cfg" 6)
-  case "$sr" in ''|*[!0-9]*) return 1 ;; esac
-  [ $((sr & 16)) -ne 0 ] || return 1          # capability list present?
-  ptr=$(rdb "$cfg" 52)                        # 0x34 capabilities pointer
-  case "$ptr" in ''|*[!0-9]*) return 1 ;; esac
-  ptr=$((ptr & 252))
-  i=0
+  sr=$(rdb "$cfg" 6); case "$sr" in ''|*[!0-9]*) return 1 ;; esac
+  [ $((sr & 16)) -ne 0 ] || return 1
+  ptr=$(rdb "$cfg" 52); case "$ptr" in ''|*[!0-9]*) return 1 ;; esac
+  ptr=$((ptr & 252)); i=0
   while [ "$ptr" -gt 0 ] && [ "$ptr" -ne 255 ] && [ "$i" -lt 48 ]; do
-    cid=$(rdb "$cfg" "$ptr")
-    case "$cid" in ''|*[!0-9]*) return 1 ;; esac
-    [ "$cid" -eq 16 ] && { echo "$ptr"; return 0; }    # 0x10 = PCI Express
-    nx=$(rdb "$cfg" $((ptr + 1)))
-    case "$nx" in ''|*[!0-9]*) return 1 ;; esac
-    ptr=$((nx & 252))
-    i=$((i + 1))
+    cid=$(rdb "$cfg" "$ptr"); case "$cid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$cid" -eq 16 ] && { echo "$ptr"; return 0; }
+    nx=$(rdb "$cfg" $((ptr + 1))); case "$nx" in ''|*[!0-9]*) return 1 ;; esac
+    ptr=$((nx & 252)); i=$((i + 1))
   done
   return 1
 }
 
-# A hot reset leaves the link at Gen1 - nothing performs the rate change afterwards, so
-# the endpoint ends up at 2.5 GT/s even though both ends advertise Gen3 and Link Control 2
-# already targets the maximum. Setting the Retrain Link bit makes the downstream port
-# renegotiate, which recovers full speed. Without this you lose 4x the bandwidth, which
-# matters a great deal on a multi-port SATA/NVMe card.
-retrain(){
-  bdf=$1
-  cfg=/sys/bus/pci/devices/$bdf/config
-  before=$(cat "/sys/bus/pci/devices/$bdf/current_link_speed" 2>/dev/null)
-  maxspd=$(cat "/sys/bus/pci/devices/$bdf/max_link_speed" 2>/dev/null)
-  [ "$before" = "$maxspd" ] && { log "    $bdf already at $before, no retrain needed"; return 0; }
-  cap=$(pcie_cap "$bdf") || { log "    $bdf: no PCIe capability found"; return 1; }
-  lc=$((cap + 16))                            # Link Control, low byte holds bit 5
-  cur=$(rdb "$cfg" "$lc")
-  case "$cur" in ''|*[!0-9]*) log "    $bdf: LinkControl unreadable"; return 1 ;; esac
-  log "    $bdf retrain: cap@0x$(printf %02X "$cap") LinkCtl@0x$(printf %02X "$lc") ${before} -> want ${maxspd}"
-  wrb "$cfg" "$lc" $((cur | 32))              # bit 5 = Retrain Link
-  sleep 2
-  after=$(cat "/sys/bus/pci/devices/$bdf/current_link_speed" 2>/dev/null)
-  log "    $bdf now at ${after}"
-  [ "$after" = "$maxspd" ] && return 0 || return 1
+find_bridges(){ for d in /sys/bus/pci/devices/*; do [ -r "$d/class" ] || continue
+  case "$(cat "$d/class" 2>/dev/null)" in 0x0604*) basename "$d" ;; esac; done; }
+
+find_storage(){ for d in /sys/bus/pci/devices/*; do [ -r "$d/class" ] || continue
+  case "$(cat "$d/class" 2>/dev/null)" in 0x0106*|0x0108*) basename "$d" ;; esac; done; }
+
+rescan_pci(){  echo 1 > /sys/bus/pci/rescan 2>/dev/null; }
+rescan_scsi(){ for h in /sys/class/scsi_host/host*; do [ -d "$h" ] && echo "- - -" > "$h/scan" 2>/dev/null; done; }
+
+state(){ echo "pci=$(ls /sys/bus/pci/devices/ 2>/dev/null | tr '\n' ' ')blk=$(ls -d /dev/sd[a-z] /dev/nvme*n1 2>/dev/null | tr '\n' ' ')"; }
+
+# initramfs passes "UUID=..." -- NOT a path -- so a bare [ -e "$1" ] can never be true.
+target_present(){
+  case "$1" in
+    UUID=*)     [ -e "/dev/disk/by-uuid/${1#UUID=}" ] && return 0 ;;
+    PARTUUID=*) [ -e "/dev/disk/by-partuuid/${1#PARTUUID=}" ] && return 0 ;;
+    LABEL=*)    [ -e "/dev/disk/by-label/${1#LABEL=}" ] && return 0 ;;
+    *)          [ -e "$1" ] && return 0 ;;
+  esac
+  return 1
+}
+any_disk_present(){ for d in /dev/sd? /dev/nvme?n1; do [ -b "$d" ] && return 0; done; return 1; }
+
+# --- link -------------------------------------------------------------------
+
+link_report(){   # link_report <bridge>  -> "speed=N width=xN active=N"
+  cap=$(pcie_cap "$1") || { echo "unreadable"; return 1; }
+  s=$(rdw /sys/bus/pci/devices/$1/config $((cap + 18))) || { echo "unreadable"; return 1; }
+  echo "LinkStatus=0x$(printf %04X "$s") speed=$((s & 15)) width=x$(( (s >> 4) & 63 )) active=$(( (s >> 13) & 1 ))"
 }
 
-find_bridges(){          # every PCI bridge (class 0x0604xx)
-  for d in /sys/bus/pci/devices/*; do
-    [ -r "$d/class" ] || continue
-    case "$(cat "$d/class" 2>/dev/null)" in
-      0x0604*) basename "$d" ;;
-    esac
+link_active(){
+  cap=$(pcie_cap "$1") || return 1
+  s=$(rdw /sys/bus/pci/devices/$1/config $((cap + 18))) || return 1
+  [ $(( (s >> 13) & 1 )) -eq 1 ]
+}
+
+wait_link(){     # wait_link <bridge> <max_seconds> -- poll, do not blind-sleep
+  i=0
+  while [ "$i" -lt "$2" ]; do
+    link_active "$1" && { log "    link active after ${i}s"; return 0; }
+    sleep 1; i=$((i + 1))
   done
+  log "    link NOT active after ${2}s"
+  return 1
 }
 
-rescan_scsi(){
-  for h in /sys/class/scsi_host/host*; do
-    [ -d "$h" ] && echo "- - -" > "$h/scan" 2>/dev/null
-  done
+retrain(){       # nudge the downstream port to renegotiate; also recovers Gen3
+  [ "$RETRAIN" = yes ] || return 0
+  bdf=$1; cfg=/sys/bus/pci/devices/$bdf/config
+  cur_s=$(cat "/sys/bus/pci/devices/$bdf/current_link_speed" 2>/dev/null)
+  max_s=$(cat "/sys/bus/pci/devices/$bdf/max_link_speed" 2>/dev/null)
+  cap=$(pcie_cap "$bdf") || return 1
+  lc=$((cap + 16))
+  cur=$(rdb "$cfg" "$lc"); case "$cur" in ''|*[!0-9]*) return 1 ;; esac
+  wrb "$cfg" "$lc" $((cur | 32))          # bit 5 = Retrain Link
+  sleep 3
+  log "    retrain $bdf: $cur_s -> $(cat "/sys/bus/pci/devices/$bdf/current_link_speed" 2>/dev/null) (max $max_s)"
 }
 
-# Secondary Bus Reset: bit 6 of Bridge Control, PCI config offset 0x3E (=62).
-# Hot-resets everything behind the bridge, which is the only way from userspace to make
-# an endpoint that U-Boot configured come back up cleanly.
-sbr(){
-  bdf=$1; hold=$2
-  cfg=/sys/bus/pci/devices/$bdf/config
+sbr(){           # Secondary Bus Reset: bit 6 of Bridge Control at config offset 0x3E
+  bdf=$1; cfg=/sys/bus/pci/devices/$bdf/config
   [ -w "$cfg" ] || { log "    $bdf: config not writable"; return 1; }
-  old=$(dd if="$cfg" bs=1 skip=62 count=1 2>/dev/null | od -An -tu1 | tr -d ' \n')
-  case "$old" in ''|*[!0-9]*) log "    $bdf: could not read BridgeControl"; return 1 ;; esac
-  new=$((old | 64))
-  log "    $bdf BridgeControl 0x3E: $old -> $new (assert SBR), hold ${hold}s"
-  printf "\\$(printf '%03o' "$new")" | dd of="$cfg" bs=1 seek=62 count=1 conv=notrunc 2>/dev/null
-  sleep "$hold"
-  printf "\\$(printf '%03o' "$old")" | dd of="$cfg" bs=1 seek=62 count=1 conv=notrunc 2>/dev/null
-  log "    $bdf BridgeControl 0x3E: $new -> $old (release SBR)"
-  sleep 2
+  # NEVER reset while a driver holds the endpoint - it detaches the device and causes
+  # transient I/O errors. If a disk is already visible we should not be here at all.
+  if any_disk_present; then log "    refusing SBR: a disk is already present"; return 1; fi
+  old=$(rdb "$cfg" 62); case "$old" in ''|*[!0-9]*) log "    $bdf: BridgeControl unreadable"; return 1 ;; esac
+  log "    $bdf SBR: BridgeControl $old -> $((old | 64)), hold ${SBR_HOLD}s"
+  wrb "$cfg" 62 $((old | 64)); sleep "$SBR_HOLD"; wrb "$cfg" 62 "$old"
 }
 
-state(){ echo "pci=$(ls /sys/bus/pci/devices/ 2>/dev/null | tr '\n' ' ')blk=$(ls -d /dev/sd* /dev/nvme*n1 2>/dev/null | tr '\n' ' ')"; }
+probe(){         # settle -> retrain -> rescan -> scsi rescan. NO resets in here.
+  br=$1
+  wait_link "$br" "$SETTLE_S"
+  retrain "$br"
+  rescan_pci; sleep 2
+  rescan_scsi; sleep 2
+  log "    $(link_report "$br")"
+}
 
-# --- main ------------------------------------------------------------------
+# --- main -------------------------------------------------------------------
 
 log "waiting for: $1"
 log "  before: $(state)"
-[ -e "$1" ] && { log "  target already present, nothing to do"; exit 0; }
+target_present "$1" && { log "  target already present, nothing to do"; exit 0; }
 
-BRIDGES=$(find_bridges)
-log "  bridges: ${BRIDGES:-none}"
+BR=$(find_bridges | head -1)
+[ -n "$BR" ] || { log "  no PCI bridge found - nothing this script can do"; exit 0; }
+log "  bridge: $BR   $(link_report "$BR")"
 
-# ---------------------------------------------------------------------------
-# The SBR is NOT reliably effective on the first attempt. Measured on a ROCK 3A
-# with a JMB585: one boot succeeded on the first SBR (disk at t+26s), another
-# needed three SBRs interleaved with a bridge remove/re-enumerate (disk at t+56s).
-# The BridgeControl register does not always read back cleanly between attempts,
-# and an SBR issued on a *freshly re-enumerated* bridge is the combination that
-# has worked most often.
-#
-# So: cycle rather than climb a ladder and give up. `rootwait` keeps initramfs
-# retrying, and each cycle costs a few seconds.
-# ---------------------------------------------------------------------------
-attempt=$((n - SBR_FIRST_ATTEMPT + 1))
-if [ "$attempt" -lt 1 ]; then
-  log "  cheap: rescan SCSI hosts (pre-SBR attempt $n)"
-  rescan_scsi
-  log "  after:  $(state)"
-  exit 0
-fi
-phase=$(( (attempt - 1) % 6 + 1 ))
-cycle=$(( (attempt - 1) / 6 + 1 ))
-log "  cycle $cycle phase $phase"
+t0=$(uptime_s); [ -n "$t0" ] || t0=0
+step=0
+done_ok=0
 
-case "$phase" in
-  1)
-    log "  SECONDARY BUS RESET (hold ${SBR_HOLD}s)"
-    for b in $BRIDGES; do sbr "$b" "$SBR_HOLD"; done
-    echo 1 > /sys/bus/pci/rescan 2>/dev/null
-    ;;
-  2)
-    log "  SECONDARY BUS RESET, longer hold"
-    for b in $BRIDGES; do sbr "$b" $((SBR_HOLD + 2)); done
-    echo 1 > /sys/bus/pci/rescan 2>/dev/null
-    ;;
-  3)
-    log "  remove bridge, re-enumerate, THEN reset (the combination that works most often)"
-    for b in $BRIDGES; do echo 1 > "/sys/bus/pci/devices/$b/remove" 2>/dev/null; done
-    sleep 1
-    echo 1 > /sys/bus/pci/rescan 2>/dev/null
-    sleep 2
-    for b in $(find_bridges); do sbr "$b" "$SBR_HOLD"; done
-    echo 1 > /sys/bus/pci/rescan 2>/dev/null
-    ;;
-  4)
-    log "  plain full PCI rescan"
-    echo 1 > /sys/bus/pci/rescan 2>/dev/null
-    ;;
-  5)
-    log "  unbind/rebind storage drivers"
-    for d in /sys/bus/pci/devices/*; do
-      [ -r "$d/class" ] || continue
-      case "$(cat "$d/class" 2>/dev/null)" in
-        0x0106*|0x0108*)                     # SATA AHCI, NVMe
-          b=$(basename "$d")
-          drv=$(readlink "$d/driver" 2>/dev/null | sed 's|.*/||')
-          [ -n "$drv" ] || continue
-          echo "$b" > "/sys/bus/pci/drivers/$drv/unbind" 2>/dev/null && log "    unbound $b from $drv"
-          sleep 1
-          echo "$b" > "/sys/bus/pci/drivers/$drv/bind"   2>/dev/null && log "    rebound $b to $drv"
-          ;;
-      esac
-    done
-    ;;
-  6)
-    log "  remove bridge, re-enumerate, THEN reset with a longer hold"
-    for b in $BRIDGES; do echo 1 > "/sys/bus/pci/devices/$b/remove" 2>/dev/null; done
-    sleep 1
-    echo 1 > /sys/bus/pci/rescan 2>/dev/null
-    sleep 2
-    for b in $(find_bridges); do sbr "$b" $((SBR_HOLD + 2)); done
-    echo 1 > /sys/bus/pci/rescan 2>/dev/null
-    ;;
-esac
+while : ; do
+  step=$((step + 1))
+  el=$(( $(uptime_s) - t0 ))
 
-sleep 2
-rescan_scsi
+  case "$step" in
+    1)  log "  step 1: plain rescan, NO reset (the link is usually already up)"
+        probe "$BR" ;;
+    2)  log "  step 2: retrain + rescan"
+        retrain "$BR"; rescan_pci; sleep 2; rescan_scsi; sleep 2 ;;
+    *)  # alternate: SBR-then-settle, and endpoint remove-then-settle
+        if [ $(( step % 2 )) -eq 1 ]; then
+          log "  step $step: ONE SBR, then ${POST_RESET_S}s quiet, then retrain+rescan"
+          sbr "$BR" && sleep "$POST_RESET_S"
+          probe "$BR"
+        else
+          log "  step $step: remove the ENDPOINT (keeps the link up), rescan, retrain"
+          for e in $(find_storage); do
+            log "    removing $e"
+            echo 1 > "/sys/bus/pci/devices/$e/remove" 2>/dev/null
+          done
+          sleep 2
+          rescan_pci; sleep 3
+          retrain "$BR"
+          rescan_scsi; sleep 2
+        fi ;;
+  esac
 
-log "  after:  $(state)"
-if [ -e "$1" ]; then
-  log "  *** TARGET PRESENT - cycle $cycle phase $phase worked ***"
-  # The hot reset drops the link to Gen1. Recover full speed now, while the disk is
-  # found but not yet in use. Verify the device survives; if not, reset again next pass.
-  if [ "$RETRAIN_AFTER_RESET" = "yes" ]; then
-    for b in $(find_bridges); do retrain "$b"; done
-    if [ -e "$1" ]; then
-      log "    link speeds after retrain:"
-      for d in /sys/bus/pci/devices/*; do
-        s=$(cat "$d/current_link_speed" 2>/dev/null) || continue
-        m=$(cat "$d/max_link_speed" 2>/dev/null)
-        log "      $(basename "$d"): $s (max $m)"
-      done
-    else
-      log "    !! target vanished after retrain - will reset again on the next pass"
-    fi
+  log "  after step $step (${el}s): $(state)"
+
+  if target_present "$1"; then
+    log "  *** TARGET PRESENT - step $step worked at ${el}s ***"
+    log "      final: $(link_report "$BR")"
+    done_ok=1; break
   fi
-fi
+  if any_disk_present; then
+    log "  *** a disk node appeared at step $step (${el}s) - stopping, letting initramfs resolve $1"
+    log "      final: $(link_report "$BR")"
+    done_ok=1; break
+  fi
+
+  el=$(( $(uptime_s) - t0 ))
+  [ "$el" -ge "$LOOP_BUDGET_S" ] && { log "  budget ${LOOP_BUDGET_S}s spent after $step steps - giving up"; break; }
+  [ "$step" -ge "$LOOP_MAX_STEPS" ] && { log "  step cap $LOOP_MAX_STEPS reached at ${el}s - giving up"; break; }
+done
+
 exit 0

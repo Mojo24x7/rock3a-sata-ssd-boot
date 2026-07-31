@@ -7,9 +7,11 @@
 #
 # Receiving end:  python3 tools/diag_listener.py
 #
-# NOTE: with `rootwait` on the kernel command line, initramfs waits FOREVER and this
-# hook never runs. Drop rootwait for a diagnostic boot, or rely on the log that
-# scripts/local-block/pcie-sbr writes to /run (which survives into the booted system).
+# NOTE: `rootwait` does NOT prevent this hook from running. In an initramfs boot the
+# initramfs does the waiting, and initramfs-tools/init parses only `rootdelay=` -- the
+# kernel's own `rootwait` never gets a chance. scripts/local gives up after ~30s of wall
+# clock and panics, which is when this runs. The log that scripts/local-block/pcie-sbr
+# writes to /run is also worth reading, and survives into the booted system on success.
 PREREQ=""
 prereqs(){ echo "$PREREQ"; }
 case $1 in
@@ -19,6 +21,25 @@ esac
 DIAG_PORT=9999
 NET_IFACE=eth0
 [ -r /etc/pcie-sbr-boot.conf ] && . /etc/pcie-sbr-boot.conf
+
+# Restart the emergency shell. It is started in init-premount but does NOT survive the drop
+# to the panic shell - measured twice on a ROCK 3A: the port was refused while the board sat
+# at the rescue prompt, so there was no interactive channel exactly when one was needed.
+# NOTE: this is `nc -ll -e`, NOT telnetd -- Debian's busybox has no telnetd applet at all
+# (verified with `busybox --list`), which is why five boots logged "telnetd on port 23"
+# while nothing listened.
+if [ "${ENABLE_TELNET:-no}" = "yes" ] && command -v busybox >/dev/null 2>&1; then
+  busybox nc -ll -p "${TELNET_PORT:-23}" -e /bin/sh >/dev/null 2>&1 &
+  NCPID=$!
+  sleep 1
+  if kill -0 "$NCPID" 2>/dev/null; then
+    echo "$NCPID" > /run/pcie-sbr-nc.pid
+    echo "[panic] nc shell listening on port ${TELNET_PORT:-23} pid $NCPID" >> /run/pcie-sbr.log
+  else
+    echo "[panic] nc shell FAILED to start" >> /run/pcie-sbr.log
+  fi
+fi
+
 [ -n "${DIAG_HOST:-}" ] || exit 0
 
 OUT=/run/pcie-sbr-report.txt
