@@ -16,6 +16,7 @@ esac
 
 SBR_HOLD=1
 SBR_FIRST_ATTEMPT=1
+RETRAIN_AFTER_RESET=yes
 [ -r /etc/pcie-sbr-boot.conf ] && . /etc/pcie-sbr-boot.conf
 
 LOG=/run/pcie-sbr.log
@@ -27,6 +28,59 @@ n=$((n + 1)); echo "$n" > "$CNT"
 log(){ echo "[pcie-sbr #$n] $*" >> "$LOG"; }
 
 # --- helpers ---------------------------------------------------------------
+
+rdb(){   # read one byte from a config-space file: rdb <file> <offset>
+  dd if="$1" bs=1 skip="$2" count=1 2>/dev/null | od -An -tu1 | tr -d ' \n'
+}
+
+wrb(){   # write one byte: wrb <file> <offset> <value>
+  printf "\\$(printf '%03o' "$3")" | dd of="$1" bs=1 seek="$2" count=1 conv=notrunc 2>/dev/null
+}
+
+pcie_cap(){   # echo the PCI Express capability offset for a device, or fail
+  cfg=/sys/bus/pci/devices/$1/config
+  [ -r "$cfg" ] || return 1
+  sr=$(rdb "$cfg" 6)
+  case "$sr" in ''|*[!0-9]*) return 1 ;; esac
+  [ $((sr & 16)) -ne 0 ] || return 1          # capability list present?
+  ptr=$(rdb "$cfg" 52)                        # 0x34 capabilities pointer
+  case "$ptr" in ''|*[!0-9]*) return 1 ;; esac
+  ptr=$((ptr & 252))
+  i=0
+  while [ "$ptr" -gt 0 ] && [ "$ptr" -ne 255 ] && [ "$i" -lt 48 ]; do
+    cid=$(rdb "$cfg" "$ptr")
+    case "$cid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$cid" -eq 16 ] && { echo "$ptr"; return 0; }    # 0x10 = PCI Express
+    nx=$(rdb "$cfg" $((ptr + 1)))
+    case "$nx" in ''|*[!0-9]*) return 1 ;; esac
+    ptr=$((nx & 252))
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# A hot reset leaves the link at Gen1 - nothing performs the rate change afterwards, so
+# the endpoint ends up at 2.5 GT/s even though both ends advertise Gen3 and Link Control 2
+# already targets the maximum. Setting the Retrain Link bit makes the downstream port
+# renegotiate, which recovers full speed. Without this you lose 4x the bandwidth, which
+# matters a great deal on a multi-port SATA/NVMe card.
+retrain(){
+  bdf=$1
+  cfg=/sys/bus/pci/devices/$bdf/config
+  before=$(cat "/sys/bus/pci/devices/$bdf/current_link_speed" 2>/dev/null)
+  maxspd=$(cat "/sys/bus/pci/devices/$bdf/max_link_speed" 2>/dev/null)
+  [ "$before" = "$maxspd" ] && { log "    $bdf already at $before, no retrain needed"; return 0; }
+  cap=$(pcie_cap "$bdf") || { log "    $bdf: no PCIe capability found"; return 1; }
+  lc=$((cap + 16))                            # Link Control, low byte holds bit 5
+  cur=$(rdb "$cfg" "$lc")
+  case "$cur" in ''|*[!0-9]*) log "    $bdf: LinkControl unreadable"; return 1 ;; esac
+  log "    $bdf retrain: cap@0x$(printf %02X "$cap") LinkCtl@0x$(printf %02X "$lc") ${before} -> want ${maxspd}"
+  wrb "$cfg" "$lc" $((cur | 32))              # bit 5 = Retrain Link
+  sleep 2
+  after=$(cat "/sys/bus/pci/devices/$bdf/current_link_speed" 2>/dev/null)
+  log "    $bdf now at ${after}"
+  [ "$after" = "$maxspd" ] && return 0 || return 1
+}
 
 find_bridges(){          # every PCI bridge (class 0x0604xx)
   for d in /sys/bus/pci/devices/*; do
@@ -149,5 +203,22 @@ sleep 2
 rescan_scsi
 
 log "  after:  $(state)"
-[ -e "$1" ] && log "  *** TARGET PRESENT - cycle $cycle phase $phase worked ***"
+if [ -e "$1" ]; then
+  log "  *** TARGET PRESENT - cycle $cycle phase $phase worked ***"
+  # The hot reset drops the link to Gen1. Recover full speed now, while the disk is
+  # found but not yet in use. Verify the device survives; if not, reset again next pass.
+  if [ "$RETRAIN_AFTER_RESET" = "yes" ]; then
+    for b in $(find_bridges); do retrain "$b"; done
+    if [ -e "$1" ]; then
+      log "    link speeds after retrain:"
+      for d in /sys/bus/pci/devices/*; do
+        s=$(cat "$d/current_link_speed" 2>/dev/null) || continue
+        m=$(cat "$d/max_link_speed" 2>/dev/null)
+        log "      $(basename "$d"): $s (max $m)"
+      done
+    else
+      log "    !! target vanished after retrain - will reset again on the next pass"
+    fi
+  fi
+fi
 exit 0

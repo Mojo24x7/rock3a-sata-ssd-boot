@@ -68,6 +68,19 @@ fi
 grep '^BUSYBOX=' "$IT/initramfs.conf" | sed 's/^/   /'
 
 say "3. hooks"
+# Retire any earlier hand-rolled version. Renaming in place is NOT enough:
+# initramfs-tools copies every file under scripts/<dir>/ into the image and runs it
+# regardless of its name, so a *.superseded file would still execute. Move it right
+# out of /etc/initramfs-tools.
+SUPERSEDED="$ROOT/var/backups/pcie-sbr-superseded-hooks"
+for old in scripts/local-block/aa-rkrescan scripts/init-premount/aa-rknet \
+           scripts/panic/zz-rkdiag scripts/local-block/aa-rkrescan.superseded \
+           scripts/init-premount/aa-rknet.superseded scripts/panic/zz-rkdiag.superseded; do
+  if [ -e "$IT/$old" ]; then
+    mkdir -p "$SUPERSEDED"
+    mv -v "$IT/$old" "$SUPERSEDED/$(basename "$old")" 2>/dev/null || true
+  fi
+done
 install -D -m 755 "$SRC/initramfs/scripts/local-block/pcie-sbr"        "$IT/scripts/local-block/pcie-sbr"
 install -D -m 755 "$SRC/initramfs/scripts/init-premount/pcie-sbr-net"  "$IT/scripts/init-premount/pcie-sbr-net"
 install -D -m 755 "$SRC/initramfs/scripts/panic/pcie-sbr-diag"         "$IT/scripts/panic/pcie-sbr-diag"
@@ -110,15 +123,23 @@ else
 fi
 
 say "7. verify"
+# NOTE: do not pipe lsinitramfs into `grep -q` here. grep exits on the first match and
+# closes the pipe, lsinitramfs dies of SIGPIPE, and `set -o pipefail` then reports the
+# whole pipeline as failed even though the match succeeded. Capture once, match in-shell.
+listing=$(lsinitramfs "$IMG" 2>/dev/null || true)
 ok=yes
-for want in scripts/local-block/pcie-sbr scripts/init-premount/pcie-sbr-net \
-            scripts/panic/pcie-sbr-diag etc/pcie-sbr-boot.conf bin/busybox bin/dd; do
-  if lsinitramfs "$IMG" 2>/dev/null | grep -q "$want"; then
-    printf '   ok      %s\n' "$want"
-  else
-    printf '   MISSING %s\n' "$want"; ok=no
-  fi
-done
+if [ -z "$listing" ]; then
+  echo "   could not list $IMG - cannot verify"
+  ok=no
+else
+  for want in scripts/local-block/pcie-sbr scripts/init-premount/pcie-sbr-net \
+              scripts/panic/pcie-sbr-diag etc/pcie-sbr-boot.conf bin/busybox bin/dd bin/od; do
+    case "$listing" in
+      *"$want"*) printf '   ok      %s\n' "$want" ;;
+      *)         printf '   MISSING %s\n' "$want"; ok=no ;;
+    esac
+  done
+fi
 
 echo
 if [ "$ok" = yes ]; then
