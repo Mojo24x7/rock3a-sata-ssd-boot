@@ -119,6 +119,27 @@ welcome; this repo will happily become obsolete.
 * U-Boot also walks the HAT's empty SATA ports, each costing a link timeout, so first
   light is slower than a microSD boot regardless of this fix.
 
+## Complete guide — blank disk to SD-less boot
+
+If you are starting from scratch, follow **[docs/PREPARE-DISK.md](docs/PREPARE-DISK.md)**.
+It covers the whole path:
+
+| step | what |
+|---|---|
+| 0 | flash U-Boot to **SPI** (mandatory — the BootROM cannot read PCIe) and verify it |
+| 1 | prepare the SSD — either write a fresh OS image, or clone your running microSD system |
+| 2 | give the SSD **unique** UUIDs and point its `fstab` / boot entry at itself |
+| 3 | **verify** with `tools/check-target.sh` before you pull the card |
+| 4 | install this fix (`install.sh --root /mnt/ssdroot`) |
+| 5 | remove the microSD and boot |
+
+The guide also lists the traps that cost the most time — duplicate UUIDs between media,
+`rootwait` being dropped by `u-boot-update`, `/boot` living on the ext4 root rather than the
+FAT partition, and a few shell footguns.
+
+If you **already have a bootable system on the disk** and only need the PCIe fix, skip
+straight to [Install](#install).
+
 ## Install
 
 ```sh
@@ -195,12 +216,22 @@ U-Boot loads the kernel over that same link. Reports welcome.
 
 ## Also in this repo
 
+* **[docs/PREPARE-DISK.md](docs/PREPARE-DISK.md)** — the complete walkthrough: SPI
+  bootloader, partitioning, writing an image or cloning your running system, unique UUIDs,
+  `fstab`/boot-entry edits, verification, first boot, rollback, and the gotchas.
+* **[tools/check-target.sh](tools/check-target.sh)** — read-only pre-flight on a prepared
+  root. Checks self-consistent UUIDs, `rootwait` in *both* places, kernel/initramfs/DTB/
+  overlays present, clean mountpoints, SSH keys, and that this fix is actually in the
+  generated initramfs. **Run it before you pull your boot medium** — a failure here costs
+  five minutes, a failure afterwards costs a card reader and another machine.
 * **[docs/REMOTE-DEBUG.md](docs/REMOTE-DEBUG.md)** — how to debug a headless board that
   won't boot **with no serial console**: get `dmesg` off it over ethernet, and get an
   interactive shell inside the initramfs. This is the part that made the diagnosis
   possible and it generalises to any boot problem.
 * **[docs/DIAGNOSIS.md](docs/DIAGNOSIS.md)** — the full evidence trail, including every
   wrong hypothesis and how it was eliminated. Useful if your symptoms differ slightly.
+* **[docs/RADXA-FORUM-POST.md](docs/RADXA-FORUM-POST.md)** — a write-up you can paste to a
+  forum, if you want to help the next person find this.
 * **[tools/uboot_caps.py](tools/uboot_caps.py)** — dump what your SPI U-Boot can actually
   boot from, by reading `/dev/mtd0`. Answers "can this board even boot that way?" in
   seconds, with no serial cable.
