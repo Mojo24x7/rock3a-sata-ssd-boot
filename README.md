@@ -86,6 +86,35 @@ enumerates it properly:
 [26.7  ] sd 1:0:0:0: [sda] Attached SCSI disk           -> root mounts, boot continues
 ```
 
+### ⚠️ The reset is not reliably effective on the first attempt
+
+Measured on the same board across two boots:
+
+| boot | what worked | disk appeared |
+|---|---|---|
+| 1 | the **first** SBR | t+26 s |
+| 2 | the **third** SBR, issued after a bridge remove + re-enumerate | t+56 s |
+
+On the second boot the first two SBRs did nothing, and `BridgeControl` read back `0`
+instead of `2` between attempts — the register state is not clean between tries. The reset
+that worked was the one issued on a **freshly re-enumerated** bridge.
+
+So the hook does not climb a ladder and give up. It **cycles** through six phases and keeps
+going for as long as `rootwait` keeps initramfs retrying:
+
+| phase | action |
+|---|---|
+| 1 | SBR, short hold |
+| 2 | SBR, longer hold |
+| 3 | **remove bridge → re-enumerate → SBR** ← the combination that works most often |
+| 4 | plain PCI rescan |
+| 5 | unbind/rebind the storage driver |
+| 6 | remove bridge → re-enumerate → SBR, longer hold |
+
+Each cycle costs a few seconds, so expect boot to take **20-60 seconds longer** than a
+microSD boot rather than a fixed amount. `/run/pcie-sbr.log` records which cycle and phase
+succeeded — worth reading after a successful boot.
+
 ### Why the obvious approaches don't work
 
 * **You cannot re-probe the host controller.** `/sys/bus/platform/drivers/rk-pcie/` has no
@@ -115,7 +144,8 @@ welcome; this repo will happily become obsolete.
   `4.000 Gb/s available PCIe bandwidth, limited by 2.5 GT/s PCIe x2 link (capable of
   15.752 Gb/s with 8.0 GT/s)`. For a single SATA SSD (~500 MB/s) this is effectively no
   loss. If you populate several bays on a 5-port HAT it will matter.
-* **Boot takes ~10 seconds longer.** The disk appears at ~t+26 s instead of ~t+16 s.
+* **Boot takes ~20-60 seconds longer.** The disk appeared at t+26 s on one boot and t+56 s
+  on another, because the reset needs a variable number of attempts (see above).
 * U-Boot also walks the HAT's empty SATA ports, each costing a link timeout, so first
   light is slower than a microSD boot regardless of this fix.
 
@@ -224,6 +254,12 @@ U-Boot loads the kernel over that same link. Reports welcome.
   overlays present, clean mountpoints, SSH keys, and that this fix is actually in the
   generated initramfs. **Run it before you pull your boot medium** — a failure here costs
   five minutes, a failure afterwards costs a card reader and another machine.
+* **[tools/verify-live.sh](tools/verify-live.sh)** — run this on a *running* system
+  **after a kernel upgrade or `rsetup`, before you reboot.** Checks that the boot entry
+  still names the running root, that `rootwait` is in both the entry and
+  `/etc/kernel/cmdline`, that every referenced kernel/initramfs/DTB/overlay exists, that
+  **every** installed initramfs still contains the fix and busybox, and which recovery
+  phase the last boot needed. Exits non-zero if a reboot would be unsafe.
 * **[docs/REMOTE-DEBUG.md](docs/REMOTE-DEBUG.md)** — how to debug a headless board that
   won't boot **with no serial console**: get `dmesg` off it over ethernet, and get an
   interactive shell inside the initramfs. This is the part that made the diagnosis

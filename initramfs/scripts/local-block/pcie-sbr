@@ -72,35 +72,51 @@ log "  before: $(state)"
 BRIDGES=$(find_bridges)
 log "  bridges: ${BRIDGES:-none}"
 
-step=$((n - SBR_FIRST_ATTEMPT + 1))
-case "$step" in
-  0|-*)                                     # attempts before the SBR: cheap rescans
-    log "  cheap: rescan SCSI hosts"
-    rescan_scsi
-    ;;
+# ---------------------------------------------------------------------------
+# The SBR is NOT reliably effective on the first attempt. Measured on a ROCK 3A
+# with a JMB585: one boot succeeded on the first SBR (disk at t+26s), another
+# needed three SBRs interleaved with a bridge remove/re-enumerate (disk at t+56s).
+# The BridgeControl register does not always read back cleanly between attempts,
+# and an SBR issued on a *freshly re-enumerated* bridge is the combination that
+# has worked most often.
+#
+# So: cycle rather than climb a ladder and give up. `rootwait` keeps initramfs
+# retrying, and each cycle costs a few seconds.
+# ---------------------------------------------------------------------------
+attempt=$((n - SBR_FIRST_ATTEMPT + 1))
+if [ "$attempt" -lt 1 ]; then
+  log "  cheap: rescan SCSI hosts (pre-SBR attempt $n)"
+  rescan_scsi
+  log "  after:  $(state)"
+  exit 0
+fi
+phase=$(( (attempt - 1) % 6 + 1 ))
+cycle=$(( (attempt - 1) / 6 + 1 ))
+log "  cycle $cycle phase $phase"
+
+case "$phase" in
   1)
     log "  SECONDARY BUS RESET (hold ${SBR_HOLD}s)"
     for b in $BRIDGES; do sbr "$b" "$SBR_HOLD"; done
     echo 1 > /sys/bus/pci/rescan 2>/dev/null
-    sleep 2; rescan_scsi
     ;;
   2)
-    log "  SECONDARY BUS RESET again, longer hold"
+    log "  SECONDARY BUS RESET, longer hold"
     for b in $BRIDGES; do sbr "$b" $((SBR_HOLD + 2)); done
     echo 1 > /sys/bus/pci/rescan 2>/dev/null
-    sleep 3; rescan_scsi
     ;;
   3)
-    log "  plain full PCI rescan"
-    echo 1 > /sys/bus/pci/rescan 2>/dev/null
-    sleep 2; rescan_scsi
-    ;;
-  4)
-    log "  remove bridges then re-enumerate"
+    log "  remove bridge, re-enumerate, THEN reset (the combination that works most often)"
     for b in $BRIDGES; do echo 1 > "/sys/bus/pci/devices/$b/remove" 2>/dev/null; done
     sleep 1
     echo 1 > /sys/bus/pci/rescan 2>/dev/null
-    sleep 3; rescan_scsi
+    sleep 2
+    for b in $(find_bridges); do sbr "$b" "$SBR_HOLD"; done
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null
+    ;;
+  4)
+    log "  plain full PCI rescan"
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null
     ;;
   5)
     log "  unbind/rebind storage drivers"
@@ -117,13 +133,21 @@ case "$step" in
           ;;
       esac
     done
-    sleep 2
     ;;
-  *)
-    [ "$step" -le 10 ] && log "  idle (enable ENABLE_TELNET to poke by hand)"
+  6)
+    log "  remove bridge, re-enumerate, THEN reset with a longer hold"
+    for b in $BRIDGES; do echo 1 > "/sys/bus/pci/devices/$b/remove" 2>/dev/null; done
+    sleep 1
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null
+    sleep 2
+    for b in $(find_bridges); do sbr "$b" $((SBR_HOLD + 2)); done
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null
     ;;
 esac
 
+sleep 2
+rescan_scsi
+
 log "  after:  $(state)"
-[ -e "$1" ] && log "  *** TARGET PRESENT - recovery step $step worked ***"
+[ -e "$1" ] && log "  *** TARGET PRESENT - cycle $cycle phase $phase worked ***"
 exit 0
