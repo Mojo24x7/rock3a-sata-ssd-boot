@@ -16,7 +16,7 @@ esac
 
 SBR_HOLD=1
 SBR_FIRST_ATTEMPT=1
-RETRAIN_AFTER_RESET=yes
+RETRAIN_AFTER_RESET=no    # see tools/pcie-relink.sh - doing this in the initramfs stalls the boot
 [ -r /etc/pcie-sbr-boot.conf ] && . /etc/pcie-sbr-boot.conf
 
 LOG=/run/pcie-sbr.log

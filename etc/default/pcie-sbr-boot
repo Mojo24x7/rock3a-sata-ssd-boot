@@ -12,12 +12,12 @@ SBR_HOLD=1
 # Set to 1 to reset on the very first attempt (fastest boot).
 SBR_FIRST_ATTEMPT=1
 
-# A hot reset leaves the link at Gen1 even though both ends advertise more and Link
-# Control 2 already targets the maximum - nothing performs the rate change afterwards.
-# yes = set the Retrain Link bit once the disk is found, recovering full link speed.
-# On a 5-port SATA card this is the difference between ~500 MB/s and ~2 GB/s shared
-# across all ports, so leave it on unless it causes trouble.
-RETRAIN_AFTER_RESET=yes
+# ⚠️ DO NOT ENABLE THIS. Setting the Retrain Link bit from the initramfs was measured to
+# STALL THE BOOT on a ROCK 3A - the link goes down during the retrain, the root device
+# disappears, and the machine never recovers (no console, no logs, tmpfs log lost).
+# Recovering full link speed is worth doing, but AFTER the system is up, where a failure
+# is harmless: use tools/pcie-relink.sh --apply. Left here only so the default is explicit.
+RETRAIN_AFTER_RESET=no
 
 # Network interface used for diagnostics / telnet.
 NET_IFACE=eth0

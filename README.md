@@ -86,6 +86,35 @@ enumerates it properly:
 [26.7  ] sd 1:0:0:0: [sda] Attached SCSI disk           -> root mounts, boot continues
 ```
 
+### ⚠️ The reset leaves the link at Gen1 — recover it AFTER boot, not during
+
+A hot reset drops the link to 2.5 GT/s. Both ends advertise Gen3 and Link Control 2 already
+targets the maximum, but nothing performs the rate change, so you end up here:
+
+```
+current_link_speed = 2.5 GT/s PCIe    max_link_speed = 8.0 GT/s PCIe
+```
+
+On a single SATA SSD that is invisible (~500 MB/s either way). On a 5-port card it is the
+difference between ~500 MB/s and ~2 GB/s shared across all ports, so it matters.
+
+Setting the **Retrain Link** bit fixes it — but **do not do this from the initramfs.**
+Measured on a ROCK 3A: retraining before the root filesystem is mounted **stalls the boot**.
+The link goes down, the root device disappears, and the machine never recovers — with no
+console, no logs, and `/run` being tmpfs so the evidence is gone too.
+
+Do it once the system is up, where a failure costs nothing:
+
+```sh
+sudo ./tools/pcie-relink.sh            # report what is degraded
+sudo ./tools/pcie-relink.sh --apply    # retrain
+```
+
+⚠️ It still resets the link your disks are on — quiesce them first, and don't run it on a
+busy array. If it misbehaves you still have logs, SSH and a restart back to a working state.
+
+`RETRAIN_AFTER_RESET` in the config exists but defaults to **no** for exactly this reason.
+
 ### ⚠️ The reset is not reliably effective on the first attempt
 
 Measured on the same board across two boots:
@@ -254,6 +283,9 @@ U-Boot loads the kernel over that same link. Reports welcome.
   overlays present, clean mountpoints, SSH keys, and that this fix is actually in the
   generated initramfs. **Run it before you pull your boot medium** — a failure here costs
   five minutes, a failure afterwards costs a card reader and another machine.
+* **[tools/pcie-relink.sh](tools/pcie-relink.sh)** — recover full PCIe link speed after
+  boot. The hot reset leaves the link at Gen1; this sets the Retrain Link bit from a
+  running system, which is the only safe place to do it.
 * **[tools/verify-live.sh](tools/verify-live.sh)** — run this on a *running* system
   **after a kernel upgrade or `rsetup`, before you reboot.** Checks that the boot entry
   still names the running root, that `rootwait` is in both the entry and
