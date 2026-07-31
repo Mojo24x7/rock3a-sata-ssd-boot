@@ -1,0 +1,30 @@
+[Unit]
+# Recover full PCIe link speed after the initramfs Secondary Bus Reset.
+#
+# The SBR that makes the disk enumerate leaves the link at Gen1 (2.5 GT/s) even though
+# both ends advertise Gen3 and Link Control 2 already targets the maximum. On a 5-port
+# SATA card that is ~500 MB/s shared instead of ~2 GB/s.
+#
+# This runs AFTER the root filesystem is mounted, deliberately. Doing the retrain from
+# the initramfs was measured to stall the boot: the link goes down and there is no
+# console, no sshd and no persistent log to find out why. Here a failure is visible and
+# a restart puts you back to a working (if slower) state.
+Description=Restore full PCIe link speed after Secondary Bus Reset
+Documentation=https://github.com/Mojo24x7/rock3a-sata-ssd-boot
+After=local-fs.target
+Before=multi-user.target
+ConditionPathExists=/usr/local/sbin/pcie-relink.sh
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pcie-relink.sh --apply
+# Never let this block or fail the boot: if the retrain does not work you simply stay
+# at Gen1, which is exactly the state you were in before.
+TimeoutStartSec=90
+SuccessExitStatus=0 1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

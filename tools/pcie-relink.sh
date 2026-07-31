@@ -27,6 +27,22 @@ APPLY=no
 rdb(){ dd if="$1" bs=1 skip="$2" count=1 2>/dev/null | od -An -tu1 | tr -d ' \n'; }
 wrb(){ printf "\\$(printf '%03o' "$3")" | dd of="$1" bs=1 seek="$2" count=1 conv=notrunc 2>/dev/null; }
 
+# Wait for LinkSta bit 11 (Link Training) to clear. ★ THIS IS THE STEP THAT MATTERS:
+# skipping it is what made an earlier initramfs version stall the boot - the mount raced
+# a link that was still training. Measured: training completes well within 5s.
+wait_training(){
+  cfg=$1; cap=$2; n=0
+  while [ "$n" -lt 40 ]; do
+    hi=$(rdb "$cfg" $((cap + 19)))            # high byte of LinkSta at cap+0x12
+    case "$hi" in ''|*[!0-9]*) return 0 ;; esac
+    [ $((hi & 8)) -eq 0 ] && return 0         # bit 11 clear -> training finished
+    sleep 0.25 2>/dev/null || sleep 1
+    n=$((n + 1))
+  done
+  echo "  warning: link still training after timeout"
+  return 1
+}
+
 pcie_cap(){
   cfg=/sys/bus/pci/devices/$1/config
   [ -r "$cfg" ] || return 1
@@ -91,9 +107,19 @@ for b in $degraded; do
   case "$cur" in ''|*[!0-9]*) echo "  $b: LinkControl unreadable, skipping"; continue ;; esac
   echo "  $b: setting Retrain Link (bit 5)"
   wrb "$cfg" "$lc" $((cur | 32))
-  sleep 3
+  wait_training "$cfg" "$cap"                 # do NOT proceed while the link trains
+  sleep 1
   echo "  $b: now $(cat "/sys/bus/pci/devices/$b/current_link_speed" 2>/dev/null)"
 done
+
+# The disks must still be there. Verified on hardware that they survive a retrain, but
+# check anyway - if something did go wrong we want it in the log, not discovered later.
+echo
+echo "=== device check"
+for d in /sys/block/sd* /sys/block/nvme*; do
+  [ -e "$d" ] && echo "  present: $(basename "$d")"
+done
+[ -d /sys/block ] || echo "  (no block devices?!)"
 
 echo
 echo "=== after"
